@@ -11,14 +11,14 @@ logging:
 
 db_meta:
   host: localhost
-  port: 3306
+  port: 3307
   user: lzs
   password: Lzs666
   database: meta
 
 db_dw:
   host: localhost
-  port: 3306
+  port: 3307
   user: lzs
   password: Lzs666
   database: dw

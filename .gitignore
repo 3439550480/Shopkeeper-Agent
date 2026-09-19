@@ -12,5 +12,20 @@ venv/
 
 # 大模型/嵌入模型文件 (关键！)
 docker/embedding/
- 
- 
+
+# 环境变量与密钥（.env.example 除外）
+.env
+*.env
+!*.env.example
+!**/.env.example
+
+# 日志
+logs/
+**/logs/
+*.log
+
+# 临时文件
+temp_files.txt
+
+# Node / 前端
+node_modules/

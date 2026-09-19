@@ -9,7 +9,7 @@ services:
       MYSQL_PASSWORD: Lzs666
       LANG: C.UTF-8
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql:/docker-entrypoint-initdb.d
