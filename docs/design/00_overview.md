@@ -1,6 +1,6 @@
 # 00 · 总体架构与全局约定
 
-> 状态：`final`（已评审定稿）　|　修订记录：2026-09-19 初稿；同日修订模型配置（deepseek-flash/glm-5.3-flash/qwen3.8-flash + DeepSeek 峰谷双条目）与能力命名（text2sql→dataquery）
+> 状态：`final`（已评审定稿）　|　修订记录：2026-09-19 初稿；同日修订模型配置与能力命名（text2sql→dataquery）；2026-09-21 修订定价结构（**3 个物理模型**，DeepSeek 峰谷为计费时段）、M5 拆分为上下文管理（05）/记忆管理（06）两模块、记忆策略定为 Simple Notes + Advanced JSON Cards + 基础回忆评估、路由策略定为规则→embedding→LLM 递进通道、新增评估子模块开关（`features.evaluation.*`）与 M4 的 skill+工具化预留方向
 > 本文档是后续所有模块约束文档（01~06）的上位文档，定义全局架构、事件协议契约、Feature Flags 与配置总览。与下位文档冲突时，以本文档为准；本文档修订须同步评审受影响的下位文档。
 
 ---
@@ -31,9 +31,10 @@
 | M1 | LLM 多模型封装 | providers 配置化、create_llm 工厂、用量自动采集 | 01 |
 | M2 | 模型选择 | 后端 model 字段 + /api/models；前端模型下拉 | 02 |
 | M3 | 评估框架 | 评测集 + 质量指标 + 成本指标 + runner + 报告 + CLI | 03 |
-| M4 | 能力路由体系 | 能力注册表 + 三级路由 + graph 改造 + default 能力 | 04 |
-| M5 | 上下文管理与记忆 | context_store / history_provider / memory（短期记忆=轨迹，随会话隔离落地；长期预留） | 05 |
-| M6 | Feature Flags | 所有模块的配置开关，与 M3 联动做组合实验 | 00（本文档） |
+| M4 | 能力路由体系 | 能力注册表 + 三级路由 + graph 改造 + default 能力；**预留演进方向：能力 skill+工具化**（问数从"路由目标"演进为"agent 主动调用的工具"，评估需量化工具触发正确性——04 文档设计） | 04 |
+| M5 | 上下文管理 | 轨迹的存储与生命周期：context_store / history_provider / 窗口截断 / 能力间隔离 / KV cache 友好提示词结构 / checkpointer 抽象 | 05 |
+| M6 | 记忆管理 | 轨迹之上的使用策略：短期记忆（相关历史检索注入）+ 长期记忆接口预留 | 06 |
+| M7 | Feature Flags | 所有模块的配置开关，与 M3 联动做组合实验 | 00（本文档） |
 
 另有贯穿性工作：教学遗留清理与端到端验收（06 文档）。
 
@@ -41,12 +42,13 @@
 
 | 术语 | 定义 | 使用范围 |
 |------|------|---------|
-| **轨迹（Trajectory）** | **短期记忆的项目内命名**——单次会话（thread_id）的完整对话记录，包含用户消息、最终回答及关键中间产物 | 05 文档及代码命名（如 `trajectory` 相关类/字段） |
-| 会话隔离 | 每个 thread_id 独立配备一条轨迹，会话之间记忆与上下文互不可见 | 05 文档（context_store / memory 的主键设计） |
+| **轨迹（Trajectory）** | **短期记忆的项目内命名**——单次会话（thread_id）的完整对话记录，包含用户消息、最终回答及关键中间产物 | 05/06 文档及代码命名（如 `trajectory` 相关类/字段） |
+| 会话隔离 | 每个 thread_id 独立配备一条轨迹，会话之间记忆与上下文互不可见 | 05 文档（context_store 主键设计）、06 文档（记忆检索范围） |
 | 能力（Capability） | 路由层的分发单元，v1 = `dataquery` / `default` | 04 文档及全链路 |
-| Provider | LLM 配置条目（含模型+定价），同一物理模型可拆多个 provider（如 DeepSeek 峰谷） | 01/03 文档 |
+| Provider | LLM 配置条目（模型 + 定价策略）；物理模型共 3 个，DeepSeek 的 peak/offpeak 是 `pricing.tiers` 计费档位（按调用时间自动判定），**不是可选模型** | 01/03 文档 |
 
-> 短期记忆 = 轨迹这一命名由项目所有者指定，避免与通用"session history"概念混淆；05 文档的接口与字段命名必须遵循（如 `TrajectoryStore` 而非 `ShortTermMemoryStore`）。
+> 短期记忆 = 轨迹这一命名由项目所有者指定，避免与通用"session history"概念混淆；接口与字段命名必须遵循（如 `TrajectoryStore` 而非 `ShortTermMemoryStore`）。
+> **职责分界**：05（上下文管理）负责轨迹的**存储与生命周期**（记账、截断、隔离、KV cache 结构）；06（记忆管理）负责轨迹之上的**使用策略**（相关历史检索注入）与长期记忆接口。
 
 ---
 
@@ -108,10 +110,17 @@ graph TD
 |------|------|--------|---------|-------------------|---------|---------|
 | `features.usage_tracking` | bool | `true` | create_llm 给模型实例挂 LLMUsageTracker，自动采集 token/耗时/调用次数 | 不挂 tracker，LLM 调用照常，无任何计量 | M1 | 01 |
 | `features.capability_routing` | bool | `true` | 请求进入能力路由层（分类→分发），default 能力可用 | 绕过路由，请求直接进入 dataquery 问数链路（现状行为） | M4 | 04 |
-| `features.rules_fast_path` | bool | `true` | 分类前置规则通道生效，命中正则/关键词直接分发（0 token） | 关闭规则通道，全部请求走 LLM 分类 | M4 | 04 |
+| `features.rules_fast_path` | bool | `true` | 分类前置规则通道生效，**高确定性**正则命中直接分发（0 token） | 关闭规则通道，未命中直接进入下一级（embedding/LLM） | M4 | 04 |
+| `features.embedding_route` | bool | `true` | 规则未命中后启用 embedding 安全网（examples 向量相似度 ≥ 阈值即分发） | 跳过安全网，未命中直接走 LLM 分类 | M4 | 04 |
 | `features.context_management` | bool | `true` | 节点历史从 context_store/history_provider 统一供给，含截断与摘要钩子 | 各节点维持现状自行拼 `state["messages"]` | M5 | 05 |
-| `features.memory.short_term` | bool | `true` | 当前问题先检索本会话相关历史，注入提示词 | 不做记忆检索注入 | M5 | 05 |
-| `features.memory.long_term` | bool | `false` | （预留）长期记忆读写生效 | 长期记忆完全不介入 | M5 | 05 |
+| `features.memory.short_term` | bool | `true` | **v1 无独立行为**：原"会话内检索注入"设计已被 05 轨迹完整注入吸收 | 同左 | M5 | 05 |
+| `features.memory.long_term` | bool | `false` | 长期记忆生效：运行后提取（Simple Notes / Advanced JSON Cards）+ 检索注入 + 基础回忆评估（有副作用：持久化写入） | 不提取、不注入、评测跳过 memory 用例 | M6 | 06 |
+| `features.evaluation.retrieval_metrics` | bool | `true` | 计算检索三通道指标（hit@k/MRR/P/R） | 报告中该区标记 `disabled`，不计算 | M3 | 03 |
+| `features.evaluation.intent_metrics` | bool | `true` | 计算意图准确率与混淆矩阵 | 同上 | M3 | 03 |
+| `features.evaluation.sql_metrics` | bool | `true` | 计算 SQL 可执行率与结果集正确性 | 同上 | M3 | 03 |
+| `features.evaluation.cost_metrics` | bool | `true` | 计算 token/费用/环节耗时成本指标 | 同上（token 计数仍采集，仅不折算呈现） | M3 | 03 |
+| `features.evaluation.tool_metrics` | bool | `true` | 计算工具/能力触发正确性（v1=能力路由命中；skill 化后=真实 tool_calls） | 同上 | M3 | 03 |
+| `features.evaluation.memory_metrics` | bool | `true` | 计算基础回忆三指标（存储成功率/回忆准确率/跨实例存活） | 报告 memory 区标记 `disabled` | M3 | 06 |
 
 ### 3.2 开关使用纪律
 
@@ -232,47 +241,51 @@ es:                           # [MODIFY] 删除无效的 index_name（实际索�
   port: 9200
 
 llm:                          # [MODIFY] 单模型 → 多厂商 providers（详见 01 文档）
-  default: deepseek-flash-offpeak   # 默认 provider；请求未指定/非法时兜底
+  default: deepseek           # 默认 provider；请求未指定/非法时兜底
   providers:
-    # DeepSeek：高峰/低谷是同一模型（deepseek-flash / V4.1-Flash）的不同计费时段，
-    # 拆为两个 provider 条目 → 评估报告中作为两个"模型"独立成行对比（peak vs offpeak）
-    deepseek-flash-offpeak:
+    # 物理模型共 3 个。DeepSeek 的峰谷是"计费时段"而非模型版本或用户选项——
+    # 由调用发生时的真实时间（北京时间）自动判定 tier，前端下拉只展示 3 个模型。
+    deepseek:
       base_url: https://api.deepseek.com      # OpenAI 格式（Anthropic 格式端点本项目不使用）
       api_key: ${DEEPSEEK_API_KEY}
       model: deepseek-flash                   # 版本 DeepSeek-V4.1-Flash；思考模式默认开启（关闭方式在 01 文档定义）
-      price_tier: offpeak                     # 空闲时段
-      price_input: 1.0                        # 输入·缓存未命中
-      price_input_cache_hit: 0.02             # 输入·缓存命中
-      price_output: 4.0
-    deepseek-flash-peak:
-      base_url: https://api.deepseek.com
-      api_key: ${DEEPSEEK_API_KEY}
-      model: deepseek-flash
-      price_tier: peak                        # 高峰时段
-      price_input: 2.0
-      price_input_cache_hit: 0.04
-      price_output: 8.0
+      pricing:
+        tiers:
+          peak:                               # 高峰：周一至周五 9:00–12:00、14:00–18:00（北京时间）
+            input: 2.0                        # 输入·缓存未命中
+            input_cache_hit: 0.04             # 输入·缓存命中
+            output: 8.0
+          offpeak:                            # 空闲：工作日 12:00–14:00、18:00–次日9:00、周末全天、法定节假日全天
+            input: 1.0
+            input_cache_hit: 0.02
+            output: 4.0
+        tier_rules: beijing_workweek          # 时段判定器标识（实现见 03 文档 cost 模块）
     qwen:
       base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
       api_key: ${DASHSCOPE_API_KEY}
       model: qwen3.8-flash
-      price_input: 0.8        # 元/百万 token
-      price_input_cache_hit: 0.1
-      price_output: 2.7
-      # 以下官方价格项不纳入 v1 成本核算：Batch File 0.4/1.35、Batch Chat 限时5折 0.4/1.35、
-      # 显式缓存创建 1.25、显式缓存命中 0.1（隐式缓存命中 0.1 已由 price_input_cache_hit 表达）
+      pricing:
+        tiers:
+          standard:                           # 无分时段策略 → 单一 standard 档
+            input: 0.8
+            input_cache_hit: 0.1
+            output: 2.7
+          # Batch/显式缓存等促销价不纳入 v1 成本核算
     glm:
       base_url: https://open.bigmodel.cn/api/paas/v4
       api_key: ${ZHIPU_API_KEY}
       model: glm-5.3-flash
-      price_input: 0.8        # 元/百万 token（以官方定价表为准）
-      price_input_cache_hit: 0.23
-      price_output: 2.8       # Batch 限时5折价（1.35）等促销价不纳入 v1 成本核算
+      pricing:
+        tiers:
+          standard:
+            input: 0.8
+            input_cache_hit: 0.23
+            output: 2.8
+          # Batch 限时5折价（1.35）等促销价不纳入 v1 成本核算
 
-# price_* 单位均为元/百万 token；字段缺失（null）时成本指标降级为仅 token 计数。
-# 定价表外置于配置文件，厂商调价只需改此文件。
-# 同一物理模型拆多个 provider 条目（如 DeepSeek 分时段）时，评估报告按 provider 名独立成行；
-# 时段归属由评测发起人选择对应 provider 决定，运行时不做自动时段判断。
+# pricing.tiers.* 单位均为元/百万 token；档位缺失（null）时成本指标降级为仅 token 计数。
+# 定价表外置于配置，厂商调价只需改此文件。
+# DeepSeek 峰谷归属由 03 文档的时段判定器按调用时间戳自动计算（评测时可 --pricing-tier 强制固定以便对比）。
 
 sql:                          # [不变]
   max_retries: 2
@@ -298,17 +311,23 @@ capabilities:
   - name: dataquery                   # 电商问数（现有 19 节点链路；原计划名 text2sql 已更名为 dataquery）
     description: 基于电商数仓的指标查询与SQL问答
     examples: ["上个月GMV多少", "华北地区的复购率"]
-    rules:                            # 规则快路径（正则，命中即分发）
-      - "查询|统计|多少|排行|趋势|GMV|订单|销售额|复购|客单价|转化"
+    entry: extract_keywords           # 图中入口节点名（路由命中后分发到该节点）
+    rules:                            # 规则快路径：只放"高度确定"表述，模糊词交由 embedding/LLM 层
+      - "数据查询|查询数据|查一下数据"
+      - "(帮我|给我)?(统计|查询|查一下).{0,12}(GMV|销售额|订单量|复购率|客单价|转化率|销量)"
   - name: default                     # 默认通用对话（兜底）
-    description: 通用助手对话：闲聊、使用帮助、无法归类问题的兜底
-    examples: ["你好", "你能做什么"]
+    description: 通用助手对话：闲聊、使用帮助、回顾上次结果、无法归类问题的兜底
+    examples: ["你好", "你能做什么", "刚才的结果是什么意思"]
+    entry: default_answer
     rules:
       - "^(你好|hi|hello|在吗)"
-      - "帮助|怎么用|你能做什么|介绍.*功能"
 
 routing:
-  default_capability: default         # LLM 分类失败/无法归类时的兜底能力
+  default_capability: default         # LLM 分类成功但结果不在注册表时兜底
+  error_capability: default           # LLM 调用失败时兜底（通用对话节点致歉并建议重试）
+  classifier_provider: deepseek       # 路由分类专用 LLM（暂定；后续按评估的精准度+速度敲定）
+  embedding_threshold: 0.85           # embedding 安全网命中阈值
+  # 识别通道：规则(高确定性) → embedding 安全网 → LLM 分类的四级递进，详见 04 文档 §3.2
 ```
 
 > 完整 Schema、能力接口约定与开关组合行为矩阵见 04 文档。
@@ -322,8 +341,8 @@ routing:
 ```
 00_overview ──┬─→ 01_llm_factory ─→ 02_model_selection
               │         └─────────→ 03_evaluation
-              ├─→ 04_capability_routing ─→ 05_context_memory
-              └──────────────（2/3/4/5 全部）──→ 06_acceptance
+              ├─→ 04_capability_routing ─→ 05_context_management ─→ 06_memory
+              └──────────────（2/3/4/5/6 全部）──→ 07_acceptance
 ```
 
 ### 6.2 运行时依赖（编码顺序）
@@ -349,13 +368,14 @@ M1 LLM封装(01) ─→ M2 模型选择(02) ─→ M3 评估(03, 跑baseline)
 
 | 文档 | 模块 | 状态 |
 |------|------|------|
-| 00_overview.md（本文） | 总体架构 + 协议契约 + Flags + 配置总览 | draft |
-| 01_llm_factory.md | M1 | 待撰写 |
-| 02_model_selection.md | M2 | 待撰写 |
-| 03_evaluation.md | M3 | 待撰写 |
-| 04_capability_routing.md | M4 | 待撰写 |
-| 05_context_memory.md | M5 | 待撰写 |
-| 06_acceptance.md | 验收 | 待撰写 |
+| 00_overview.md（本文） | 总体架构 + 协议契约 + Flags + 配置总览 | final（2026-09-21 修订） |
+| 01_llm_factory.md | M1 | final（2026-09-21 修订定价结构） |
+| 02_model_selection.md | M2 | final（2026-09-21 修订上拉弹层/3 模型） |
+| 03_evaluation.md | M3 | final（2026-09-21 补工具指标/子模块开关） |
+| 04_capability_routing.md | M4 | final（2026-09-21 路由策略经所有者确认） |
+| 05_context_management.md | M5 上下文管理 | 待撰写（拆分自原 05） |
+| 06_memory.md | M6 记忆管理 | 待撰写（拆分自原 05） |
+| 07_acceptance.md | 验收 | draft（待评审） |
 
 ### 7.2 评审流程约定
 

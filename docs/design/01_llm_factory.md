@@ -1,7 +1,7 @@
 # 01 · LLM 多模型封装与用量采集（M1）
 
 > 状态：`final`（已评审定稿）　|　上位文档：[00_overview.md](00_overview.md)（final）
-> 修订记录：2026-09-19 初稿；同日补充 KV cache 技术债登记与轨迹术语对齐
+> 修订记录：2026-09-19 初稿；同日补充 KV cache 技术债登记与轨迹术语对齐；2026-09-21 定价结构修订（3 模型 + DeepSeek tiers 档位，provider 不按峰谷拆分）
 > 本章所有改动点均基于 2026-09-19 对代码库的精确核对（9 个 LLM 引用点已逐一确认），核对明细见 §4。
 
 ---
@@ -38,45 +38,39 @@
 
 ```yaml
 llm:
-  default: deepseek-flash-offpeak   # 默认 provider 名；请求未指定/非法时兜底
+  default: deepseek           # 默认 provider 名；请求未指定/非法时兜底
   providers:
-    deepseek-flash-offpeak:
+    # 物理模型 3 个；DeepSeek 的峰谷是 pricing.tiers 计费档位（按调用时间自动判定），不是可选模型
+    deepseek:
       base_url: https://api.deepseek.com
       api_key: ${DEEPSEEK_API_KEY}
       model: deepseek-flash
-      price_tier: offpeak
-      price_input: 1.0
-      price_input_cache_hit: 0.02
-      price_output: 4.0
-    deepseek-flash-peak:
-      base_url: https://api.deepseek.com
-      api_key: ${DEEPSEEK_API_KEY}
-      model: deepseek-flash
-      price_tier: peak
-      price_input: 2.0
-      price_input_cache_hit: 0.04
-      price_output: 8.0
+      pricing:
+        tiers:
+          peak:    {input: 2.0, input_cache_hit: 0.04, output: 8.0}
+          offpeak: {input: 1.0, input_cache_hit: 0.02, output: 4.0}
+        tier_rules: beijing_workweek            # 时段判定器在 03 文档 cost 模块实现
     qwen:
       base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
       api_key: ${DASHSCOPE_API_KEY}
       model: qwen3.8-flash
-      price_input: 0.8
-      price_input_cache_hit: 0.1
-      price_output: 2.7
+      pricing:
+        tiers:
+          standard: {input: 0.8, input_cache_hit: 0.1, output: 2.7}
     glm:
       base_url: https://open.bigmodel.cn/api/paas/v4
       api_key: ${ZHIPU_API_KEY}
       model: glm-5.3-flash
-      price_input: 0.8
-      price_input_cache_hit: 0.23
-      price_output: 2.8
+      pricing:
+        tiers:
+          standard: {input: 0.8, input_cache_hit: 0.23, output: 2.8}
 ```
 
 ### 2.2 本模块新增的**可选** provider 字段（在 00 基础上补充）
 
 ```yaml
   providers:
-    deepseek-flash-offpeak:
+    deepseek:
       # ...上述已定稿字段之外，工厂额外支持（均可缺省）：
       temperature: 0.7              # 缺省 0.7（与现状 llm.py 一致）
       extra_params: {}              # 透传给 ChatOpenAI 的 model_kwargs，见 §2.3
@@ -97,16 +91,23 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 @dataclass
+class PriceTier:                                # 单个计费档位的单价（元/百万 token，可缺省）
+    input: Optional[float] = None
+    input_cache_hit: Optional[float] = None
+    output: Optional[float] = None
+
+@dataclass
+class PricingConfig:                            # DeepSeek 含 peak/offpeak 两档；Qwen/GLM 仅 standard 一档
+    tiers: dict = field(default_factory=dict)   # dict[str, PriceTier]
+    tier_rules: Optional[str] = None            # "beijing_workweek" → 03 文档的时段判定器；None = 恒用唯一档
+
+@dataclass
 class LLMProviderConfig:
     base_url: str
     api_key: str
     model: str
     temperature: float = 0.7
-    # 定价字段（成本评估用，可缺省；单位：元/百万 token）
-    price_input: Optional[float] = None
-    price_input_cache_hit: Optional[float] = None
-    price_output: Optional[float] = None
-    price_tier: Optional[str] = None            # offpeak / peak / None
+    pricing: PricingConfig = None               # 成本评估用，可缺省
     # 厂商专有参数透传（如 DeepSeek 思考模式开关、Qwen enable_thinking）
     extra_params: dict = field(default_factory=dict)
 
@@ -339,7 +340,7 @@ chain = prompt | llm | output_parser   # 此行结构不变
 
 1. **`callbacks` 构造参数 vs `config` 传参**：LangChain 不同版本对实例级 callbacks 的支持细节有差异（`ChatOpenAI(callbacks=...)` 为合法构造参数）。编码时若发现实例级 callback 未生效（summary 为空），降级方案：节点不改动，`QueryService` 在 `graph.astream(config={"callbacks": [tracker], ...})` 处挂载——LangGraph 会把 callbacks 传播到所有节点内部调用。此方案同样零侵入节点，已在设计中预留
 2. **DeepSeek peak/offpeak 与缓存命中价的成本口径**：v1 成本计算一律按"输入=未命中价、输出=输出价"，缓存命中的节省体现在真实账单而非报告；03 文档会在报告口径说明中注明
-3. **provider 命名含连字符**（`deepseek-flash-offpeak`）：作为 dict key 与前端下拉 value 均合法（URL 编码无关），不受影响
+3. **峰谷定价不在工厂处理**：`create_llm` 只负责模型实例；`pricing.tiers` 的档位判定（北京工作时间表 + 节假日）由 03 文档的成本模块按调用时间戳实现，工厂与 tracker 不感知档位
 4. **`init_chat_model` vs 直接 `ChatOpenAI`**：工厂内部直接用 `langchain_openai.ChatOpenAI`（不经 init_chat_model 分发），少一层间接、报错更直白；`langchain.chat_models.init_chat_model` 不再被引用（llm.py 死导入清理）
 5. **KV cache（已登记，勿在本模块修）**：见 §3.4 警示块——prompt 前缀不稳定导致厂商隐式缓存无法命中，属上下文管理（05）的改造范围；本模块若顺手改 prompt 结构会破坏 baseline 实验的对照组
 6. **术语对齐**：05 文档中短期记忆的项目内命名为**轨迹（Trajectory）**（单次会话完整对话，随 thread_id 会话隔离），本模块不涉及，但 tracker 的 `by_stage` 聚合与轨迹无关（环节级 ≠ 会话级），编码时勿混淆两个统计口径

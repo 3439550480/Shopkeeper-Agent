@@ -1,7 +1,7 @@
 # 02 · 前端模型选择（M2）
 
 > 状态：`final`（已评审定稿）　|　上位文档：[00_overview.md](00_overview.md)（final）、[01_llm_factory.md](01_llm_factory.md)（final）
-> 修订记录：2026-09-19 初稿；同日模型选择 UI 由原生 select 改为 WorkBuddy 风格上拉弹层
+> 修订记录：2026-09-19 初稿；同日模型选择 UI 由原生 select 改为 WorkBuddy 风格上拉弹层；2026-09-21 下拉从 4 条目（含峰谷）改为 **3 个模型**（DeepSeek 峰谷为计费时段，非用户选项）
 > 改动点基于 2026-09-19 对 `Composer.tsx` / `App.tsx`（props 结构）/ `agentApi.ts` / `query_router.py` / `query_schema.py` 的现状核对。
 
 ---
@@ -42,19 +42,17 @@
 
 ```json
 {
-  "default": "deepseek-flash-offpeak",
+  "default": "deepseek",
   "providers": [
-    { "name": "deepseek-flash-offpeak", "model": "deepseek-flash", "group": "DeepSeek", "price_tier": "offpeak" },
-    { "name": "deepseek-flash-peak",    "model": "deepseek-flash", "group": "DeepSeek", "price_tier": "peak" },
-    { "name": "qwen",                   "model": "qwen3.8-flash",  "group": "Qwen",     "price_tier": null },
-    { "name": "glm",                    "model": "glm-5.3-flash",  "group": "GLM",      "price_tier": null }
+    { "name": "deepseek", "model": "deepseek-flash", "group": "DeepSeek" },
+    { "name": "qwen",     "model": "qwen3.8-flash",  "group": "Qwen" },
+    { "name": "glm",      "model": "glm-5.3-flash",  "group": "GLM" }
   ]
 }
 ```
 
 - `group` 由后端从 provider 名推导（**不进配置**）：`deepseek-* → DeepSeek`、`qwen* → Qwen`、`glm* → GLM`、其余 → `Other`。推导映射硬编码在端点实现中，新增 provider 组时改这一处
-- `price_tier` 直通配置（可能为 null）
-- **不返回价格字段**：价格属评估域（03），避免诱导用户按价选模型的 UI 语义；如后续要展示，另行评审
+- **不返回价格/时段字段**：DeepSeek 峰谷是计费时段（由调用时间自动判定），不是用户选项，前端不展示；价格属评估域（03）。如后续要展示，另行评审
 - 分组顺序：按 `group` 名排序（DeepSeek / GLM / Qwen 字母序），组内按配置文件声明顺序
 
 ### 3.2 `QuerySchema` 变更（`app/api/schemas/query_schema.py`）
@@ -81,7 +79,6 @@ export type ModelInfo = {
   name: string;        // provider 名，作为请求体 model 值与下拉 value
   model: string;       // 物理模型名，用于 title 提示
   group: string;       // 分组名（下拉 optgroup）
-  price_tier: string | null;
 };
 
 export type ModelsResponse = {
@@ -113,9 +110,8 @@ export type QueryOptions = {
 ┌────────────────────────────────────┐   ┌────────────────────────────────────┐
 │ ✦ deepseek-flash ▴  问个问题... [▲] │   │ ┌───────────────────────────────┐  │
 └────────────────────────────────────┘   │ │ ● DeepSeek                    │  │
-        按钮 = 当前模型短名 + ▴ 图标       │ │   ✓ deepseek-flash（低谷）     │  │
-                （点击向上展开面板）        │ │     deepseek-flash（高峰）     │  │
-                                         │ │ ● GLM                         │  │
+        按钮 = 当前模型短名 + ▴ 图标       │ │   ✓ deepseek-flash            │  │
+                （点击向上展开面板）        │ │ ● GLM                         │  │
                                          │ │     glm-5.3-flash             │  │
                                          │ │ ● Qwen                        │  │
                                          │ │     qwen3.8-flash             │  │
@@ -141,8 +137,8 @@ type ComposerProps = {
 
 交互细节（上拉弹层）：
 
-1. **触发按钮**：左侧按钮显示当前模型短名（物理模型名 + `▴` 图标，`price_tier` 有值时附"高峰/低谷"徽标文案）；无第三方依赖，面板用绝对定位手写（`absolute bottom-full mb-2 left-0`，挂在输入条容器 `relative` 上）
-2. **面板结构**：按 `group` 分组渲染（组名小标题 + 组内条目）；每条目两行——第一行显示名（`deepseek-flash（低谷）`），第二行小字显示物理模型名；当前选中条目带 `✓`（lucide `Check`）高亮
+1. **触发按钮**：左侧按钮显示当前模型短名（物理模型名 + `▴` 图标）；DeepSeek 峰谷是计费时段（按调用时间自动判定），**不在 UI 呈现、不可选择**；无第三方依赖，面板用绝对定位手写（`absolute bottom-full mb-2 left-0`，挂在输入条容器 `relative` 上）
+2. **面板结构**：按 `group` 分组渲染（组名小标题 + 组内条目）；每条目两行——第一行显示名（provider 名对应模型），第二行小字显示物理模型名；当前选中条目带 `✓`（lucide `Check`）高亮
 3. **打开/关闭**：点击按钮 toggle；点击面板外（document 级 `pointerdown` 监听 + ref contains 判断）、按 `Escape`、或选中条目后自动关闭
 4. **禁用态**：`isStreaming` 时按钮 `disabled`（面板不可展开；已展开时发送请求则先收起）
 5. **空列表降级**：`models.length === 0` 时按钮不渲染（后端不可达/旧后端），请求不带 model
@@ -215,9 +211,9 @@ const handleModelChange = (name: string) => {
 
 ## 6. 验收标准
 
-1. **端点**：`GET /api/models` 返回 4 个 provider（分组正确：DeepSeek 组含 peak/offpeak 两项）、`default` 为 `deepseek-flash-offpeak`
-2. **弹层渲染**：点击左侧按钮向上弹出分组面板（DeepSeek 组两条目带"高峰/低谷"后缀与选中 ✓ 标记）；配置文件删除某 provider 后重启，面板同步少一项（前端不硬编码验证）；点击面板外 / Escape / 选中后三种方式均可关闭
-3. **选择生效**：切换到 `glm` 后发送问题，后端日志 `LLM usage | {...}` 中 `"provider": "glm"`；切回 offpeak 后日志 provider 对应变化
+1. **端点**：`GET /api/models` 返回 **3 个** provider（DeepSeek/Qwen/GLM 各一项）、`default` 为 `deepseek`
+2. **弹层渲染**：点击左侧按钮向上弹出分组面板（3 个条目 + 选中 ✓ 标记）；配置文件删除某 provider 后重启，面板同步少一项（前端不硬编码验证）；点击面板外 / Escape / 选中后三种方式均可关闭
+3. **选择生效**：切换到 `glm` 后发送问题，后端日志 `LLM usage | {...}` 中 `"provider": "glm"`；切回 deepseek 后日志 provider 对应变化
 4. **持久化**：选择 glm → 刷新页面 → 按钮显示 glm 且面板中选中标记一致（localStorage）；手工篡改 localStorage 为不存在值 → 刷新后自动重置为 default
 5. **兼容降级**：`localStorage` 清空首次访问 → 默认选中后端 default；后端停止时刷新页面 → 按钮隐藏、发送请求不带 model 字段、后端起来后功能恢复
 6. **流式中禁用**：请求流式进行中按钮禁用（面板不可展开），结束后恢复
