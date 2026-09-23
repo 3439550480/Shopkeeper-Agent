@@ -38,10 +38,66 @@ es:
   port: 9200
   index_name: data_agent
 
-llm:
-  model_name: deepseek-v4-pro
-  api_key: ${DEEPSEEK_API_KEY}
-  base_url: https://api.deepseek.com
+llm:                          # [REWRITE] 单模型 → 多厂商 providers
+  default: deepseek           # 请求未指定/非法 provider 时兜底
+  providers:
+    # 物理模型共 3 个；DeepSeek 峰谷是计费时段（按调用时间自动判定），不是用户选项
+    deepseek:
+      base_url: https://api.deepseek.com
+      api_key: ${DEEPSEEK_API_KEY}
+      model: deepseek-flash
+      pricing:
+        tiers:
+          peak:    {input: 2.0, input_cache_hit: 0.04, output: 8.0}
+          offpeak: {input: 1.0, input_cache_hit: 0.02, output: 4.0}
+        tier_rules: beijing_workweek
+    qwen:
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: ${DASHSCOPE_API_KEY}
+      model: qwen3.8-flash
+      pricing:
+        tiers:
+          standard: {input: 0.8, input_cache_hit: 0.1, output: 2.7}
+    glm:
+      base_url: https://open.bigmodel.cn/api/paas/v4
+      api_key: ${ZHIPU_API_KEY}
+      model: glm-5.3-flash
+      pricing:
+        tiers:
+          standard: {input: 0.8, input_cache_hit: 0.23, output: 2.8}
+
 
 sql:
   max_retries: 2   # SQL 校验失败后的最大重试次数
+
+features:                     # [NEW] 模块开关（定义见 docs/design/00 §3）
+  usage_tracking: true
+  capability_routing: true
+  rules_fast_path: true
+  embedding_route: true
+  capability_chip: true
+  context_management: true
+  memory:
+    short_term: true
+    long_term: false
+  evaluation:
+    retrieval_metrics: true
+    intent_metrics: true
+    sql_metrics: true
+    cost_metrics: true
+    tool_metrics: true
+    memory_metrics: true
+
+session:                      # [NEW] 上下文管理（05 文档 §2.1）
+  history_max_turns: 10
+  history_max_tokens: 4000
+  summary_trigger_turns: 20
+  summary_keep_recent_turns: 5
+
+memory:                       # [NEW] 记忆管理（06 文档 §2.1）
+  store_backend: json_file
+  store_path: data/memory
+  extract_after_run: true
+  extraction_provider: deepseek
+  retrieval_top_k: 5
+  similarity_threshold: 0.80

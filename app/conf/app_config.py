@@ -1,76 +1,172 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Dict, Optional
 import os
 import re
 
 from omegaconf import OmegaConf
 
+# ====== LLM 多模型配置（01 文档 §2.4）======
+
+# 因为"价格是多少"和"什么时候用哪个价格"是两件本质不同的事，它们的变化原因不同、来源不同、复用方式也不同。混在一起会很难维护。
+
+# 装饰器,用于标记一个类为dataclass，并自动生成__init__方法(少写一些代码)
+# Tier 英文原意是"层、级、档"
+@dataclass
+class PriceTier:
+    """单个计费档位的单价（元/百万 token）。
+    全部可缺省：厂商未公布的价格项保持 None，成本模块降级为仅 token 计数"""
+    input: Optional[float] = None    # 输入单价，可为 None
+    input_cache_hit: Optional[float] = None  # 缓存命中的输入单价，可为 None
+    output: Optional[float] = None   # 输出单价，可为 None
+
+@dataclass
+class PricingConfig:
+    """计费档位集合。DeepSeek 含 peak/offpeak 两档（tier_rules 驱动时段判定）；
+    Qwen/GLM 仅 standard 一档（tier_rules 为 None，恒用唯一档）"""
+    # Dict[键类型, 值类型] —— 字典的类型
+    # {
+    # "peak": PriceTier(input=4.0, output=12.0),
+    # "offpeak": PriceTier(input=2.0, output=8.0),
+    # }
+    # field(...) = 一张"订单备注单"，你上面写：
+    # "这份餐的配菜，每次现做一份新的，别用别人吃剩的。"
+    # default_factory=dict = 备注单上写的那句"每次现做一份新的"具体对应哪道工序
+    # 具体来说，就是"调用 dict() 现做一份"
+    # dict = 厨房里真正干活的厨师
+    tiers: Dict[str, Any] = field(default_factory=dict)  # 用来给某个字段做"额外配置"的工具
+    # tiers:Dict[str,Any] = {}  会报错，因为字典、列表这类可变对象如果直接当默认值，会被所有实例共享：
+    tier_rules: Optional[str] = None
+
+
+@dataclass
+class LLMProviderConfig:
+    """一个 provider = 一个可调用的模型条目 + 定价策略。
+    注意：providers 是按请求实例化的配置模板，不是连接对象"""
+    base_url: str = ""
+    api_key: str = ""                 # 键名与 yaml 逐字对应（struct 模式下必须一致）
+    model: str = ""
+    temperature: float = 0.7
+    pricing: PricingConfig = field(default_factory=PricingConfig)
+    extra_params: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class LLMConfig:
+    """替换原 LLMConfig（model_name/api_key/base_url 三字段已废弃，旧定义已删除）"""
+    default: str = "deepseek"         # 请求未指定/非法 provider 时的兜底
+    providers: Dict[str, Any] = field(default_factory=dict)
+
+# ====== Feature Flags（00 文档 §3 定义表）======
+
+@dataclass
+class MemoryFlags:
+    short_term: bool = True
+    long_term: bool = False
+
+@dataclass
+class EvaluationFlags:
+    retrieval_metrics: bool = True   # 检索指标
+    intent_metrics: bool = True      # 意图指标
+    sql_metrics: bool = True         # SQL 指标
+    cost_metrics: bool = True        # 成本指标
+    tool_metrics: bool = True        # 工具指标
+    memory_metrics: bool = True      # 记忆指标
+
+# 总电闸箱
+@dataclass
+class FeatureFlags:
+    usage_tracking: bool = True       # 用量统计     开
+    capability_routing: bool = True   # 能力路由     开
+    rules_fast_path: bool = True      # 规则快速通道 开
+    embedding_route: bool = True      # 向量路由     开
+    capability_chip: bool = True      # 能力芯片     开
+    context_management: bool = True   # 上下文管理   开
+    memory: MemoryFlags = field(default_factory=MemoryFlags)  # 记忆模块（子开关箱）
+    evaluation: EvaluationFlags = field(default_factory=EvaluationFlags)  # 评估模块（子开关箱）
+
+# ====== 上下文管理（05 文档 §2.2）======
+@dataclass
+class SessionConfig:
+    history_max_turns: int = 10          # 历史最多保留多少轮
+    history_max_tokens: int = 4000       # 历史最多保留多少 token
+    summary_trigger_turns: int = 20      # [预留] 摘要压缩钩子触发阈值
+    summary_keep_recent_turns: int = 5   # [预留] 摘要压缩保留最近几轮
+
+# ====== 记忆管理（06 文档 §2.2）======
+
+@dataclass
+class MemoryConfig:
+    store_backend: str = "json_file"     # 存储后端（json_file/redis/qdrant）
+    store_path: str = "data/memory"      # 存储路径（json_file）
+    extract_after_run: bool = True       # 运行后提取
+    extraction_provider: str = "deepseek"  # 提取提供者（deepseek/qwen/glm）
+    retrieval_top_k: int = 5             # 检索 topk
+    similarity_threshold: float = 0.80   # 相似度阈值
 
 # ====== 所有 dataclass 定义保持不变 ======
 @dataclass
 class File:
-    enable: bool
-    level: str
-    path: str
-    rotation: str
-    retention: str
+    enable: bool   # 是否开启
+    level: str     # 日志级别
+    path: str      # 日志路径
+    rotation: str  # 日志轮转
+    retention: str # 日志保留
 
 @dataclass
 class Console:
-    enable: bool
-    level: str
+    enable: bool  # 是否开启
+    level: str    # 日志级别
 
 @dataclass
 class LoggingConfig:
-    file: File
-    console: Console
+    file: File      # 文件日志
+    console: Console  # 控制台日志
 
 @dataclass
 class DBConfig:
-    host: str
-    port: int
-    user: str
-    password: str
-    database: str
+    host: str      # 数据库主机地址
+    port: int      # 数据库端口
+    user: str      # 数据库用户名
+    password: str  # 数据库密码
+    database: str  # 数据库名称
 
 @dataclass
 class QdrantConfig:
-    host: str
-    port: int
-    embedding_size: int
+    host: str        # 主机地址
+    port: int        # 端口
+    embedding_size: int  # 向量维度
+
 
 @dataclass
 class EmbeddingConfig:
-    host: str
-    port: int
-    model: str
+    host: str   # 主机地址
+    port: int   # 端口
+    model: str  # 模型名称
 
 @dataclass
 class ESConfig:
-    host: str
-    port: int
-    index_name: str
-
-@dataclass
-class LLMConfig:
-    model_name: str
-    api_key: str
-    base_url: str
+    host: str       # 主机地址
+    port: int       # 端口
+    index_name: str # 索引名称
 
 @dataclass
 class SQLConfig:
-    max_retries: int
+    max_retries: int  # 最大重试次数
+    # retry_delay: int # 重试延迟（秒）
 
 @dataclass
 class AppConfig:
-    logging: LoggingConfig
-    db_meta: DBConfig
-    db_dw: DBConfig
-    qdrant: QdrantConfig
-    embedding: EmbeddingConfig
-    es: ESConfig
-    llm: LLMConfig
-    sql: SQLConfig  # 新增
+    logging: LoggingConfig   # 日志配置
+    db_meta: DBConfig        # 元数据库配置
+    db_dw: DBConfig          # 数据仓库配置
+    qdrant: QdrantConfig     # 向量搜索引擎配置
+    embedding: EmbeddingConfig  # 向量生成器配置
+    es: ESConfig             # 文档搜索引擎配置
+    llm: LLMConfig           # LLM 配置（多厂商 providers）
+    sql: SQLConfig           # SQL 配置
+    features: FeatureFlags = field(default_factory=FeatureFlags)  # [NEW] 模块开关
+    session: SessionConfig = field(default_factory=SessionConfig) # [NEW] 上下文管理
+    memory: MemoryConfig = field(default_factory=MemoryConfig)    # [NEW] 记忆管理
 
 # ====================== 配置加载（修改部分） ======================
 # 修改：配置文件在项目根目录的 conf 文件夹下
@@ -84,7 +180,13 @@ with open(config_file, "r", encoding="utf-8") as f:
 # 手动替换 ${VAR_NAME} 为环境变量的值
 def replace_env_var(match):
     var_name = match.group(1)
-    return os.environ.get(var_name, f"${{{var_name}}}")  # 没找到就保留原样
+    value = os.environ.get(var_name)
+    if value is None:
+        # 环境变量缺失时【不能】保留 ${VAR} 原样：OmegaConf 会把 ${...} 当作内部插值语法
+        # 去配置树解析，找不到直接抛 InterpolationKeyError。
+        # 改用无害标记占位，create_llm 检测到标记时给出"请设置环境变量 X"的明确报错
+        return f"__MISSING_ENV_{var_name}__"
+    return value
 
 raw_yaml = re.sub(r'\$\{(\w+)}', replace_env_var, raw_yaml)
 
@@ -92,14 +194,17 @@ raw_yaml = re.sub(r'\$\{(\w+)}', replace_env_var, raw_yaml)
 context = OmegaConf.create(raw_yaml)
 
 
-#app_config.py 是"表格模板"（定义结构），app_config.yaml 是"填好的表格"（存储数据）。两者合并后，才能得到可用的配置对象->合并后的对象就是 app_config
+# app_config.py 是"表格模板"（定义结构），app_config.yaml 是"填好的表格"（存储数据）。两者合并后，才能得到可用的配置对象 -> 合并后的对象就是 app_config
 # 生成 schema 并合并
 schema = OmegaConf.structured(AppConfig)
-app_config: AppConfig = OmegaConf.to_object(OmegaConf.merge(schema, context)) #内容+结构
+app_config: AppConfig = OmegaConf.to_object(OmegaConf.merge(schema, context))  # 内容+结构
 
 
 # ====================== 测试 ======================
 if __name__ == '__main__':
     print("ES 地址 =", app_config.es.host)
-    print("LLM 模型 =", app_config.llm.model_name)
+    print("默认 LLM =", app_config.llm.default)
+    print("可用 providers =", list(app_config.llm.providers.keys()))
+    print("DeepSeek 模型 =", app_config.llm.providers["deepseek"].model)
+    print("usage_tracking 开关 =", app_config.features.usage_tracking)
     print("配置加载成功！")
