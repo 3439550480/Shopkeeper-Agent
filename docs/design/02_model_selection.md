@@ -1,7 +1,7 @@
 # 02 · 前端模型选择（M2）
 
 > 状态：`final`（已评审定稿）　|　上位文档：[00_overview.md](00_overview.md)（final）、[01_llm_factory.md](01_llm_factory.md)（final）
-> 修订记录：2026-09-19 初稿；同日模型选择 UI 由原生 select 改为 WorkBuddy 风格上拉弹层；2026-09-21 下拉从 4 条目（含峰谷）改为 **3 个模型**（DeepSeek 峰谷为计费时段，非用户选项）
+> 修订记录：2026-09-19 初稿；同日模型选择 UI 由原生 select 改为 WorkBuddy 风格上拉弹层；2026-09-21 下拉从 4 条目（含峰谷）改为 **3 个模型**（DeepSeek 峰谷为计费时段，非用户选项）；2026-09-23 新增**能力芯片**（输入框上方，tier-0 显式选择，GET /api/capabilities）
 > 改动点基于 2026-09-19 对 `Composer.tsx` / `App.tsx`（props 结构）/ `agentApi.ts` / `query_router.py` / `query_schema.py` 的现状核对。
 
 ---
@@ -183,6 +183,41 @@ const handleModelChange = (name: string) => {
 
 ---
 
+### 3.7 能力芯片（tier-0 用户显式选择，**已经项目所有者确认**）
+
+> 依赖 04 文档的路由 tier-0 设计；本节是它的前端 + API 部分。
+
+**API**：`GET /api/capabilities` —— 从 `conf/capability_config.yaml` 读 `selectable=true` 的能力（v1 仅 dataquery），前端不硬编码；新增可选能力后芯片自动多一个：
+
+```json
+{ "capabilities": [ { "name": "dataquery", "description": "基于电商数仓的指标查询与SQL问答" } ] }
+```
+
+**请求透传**：`QuerySchema` 新增 `capability: Optional[str] = None`（与 model 同模式，宽松校验）；`streamQuery` body 按需携带 `capability` 字段。
+
+**UI 形态**：**输入框上方**的小方框芯片（用户指定的位置）：
+
+```
+┌──────────────────────────────────────────┐
+│ [🔍 数据查询]            ← 芯片（选中态高亮）│
+│ ┌──────────────────────────────────────┐ │
+│ │ ✦ deepseek-flash ▴  问点什么...  [▲] │ │
+│ └──────────────────────────────────────┘ │
+└──────────────────────────────────────────┘
+```
+
+交互约定（三条均已经项目所有者确认）：
+
+1. **持续选中**：芯片是"模式开关"——点击选中后跨多条消息持续生效，再次点击取消，恢复自动意图识别；选中态存 `localStorage`（`agent_capability`），刷新保留
+2. **只列主动能力**：芯片列表来自 `/api/capabilities`（selectable=true），**default 兜底能力不出芯片**——不选芯片 = 自动识别（含 default 兜底）
+3. **选中即确定性**：选中时请求携带 capability → 后端 tier-0 直接分发（跳过规则/embedding/LLM 推断）；取消选中 = 旧行为
+
+**状态管理**（`App.tsx`）：`capabilities` / `selectedCapability` state，mount 时 `fetchCapabilities()`（失败 → 芯片不渲染，请求不带 capability）；选中值持久化 localStorage，接口返回列表中不存在时重置为空。
+
+**类型**（`types/agent.ts`）：`CapabilityInfo {name, description}`、`CapabilitiesResponse {capabilities: CapabilityInfo[]}`。
+
+---
+
 ## 4. 对现有代码的改动点清单
 
 | # | 文件 | 位置 | 操作 | 内容 |
@@ -195,6 +230,9 @@ const handleModelChange = (name: string) => {
 | 6 | `frontend/src/App.tsx` | Composer 调用处 + 顶部 state | [MODIFY] | 新增 models/defaultModel/selectedModel state、mount 时 fetchModels、handleModelChange、startQuery 传 model（§3.6） |
 | 7 | `app/api/dependencies.py` | — | **不变** | /api/models 无需依赖注入（直接读 app_config 单例） |
 | 8 | `frontend/vite.config.ts` | — | 视现状 | 若 dev 代理未覆盖 GET 路由则补充；`VITE_API_BASE_URL` 直连时无此问题（编码时核实现有 proxy 配置） |
+| 9 | `app/api/schemas/query_schema.py` | — | [MODIFY] | 新增 `capability: Optional[str] = None`（§3.7，与 model 同模式） |
+| 10 | `app/api/routers/query_router.py` | — | [MODIFY] | 新增 `@query_router.get("/api/capabilities")`（读 capability_config 的 selectable=true 条目）；`query_handler` 透传 capability |
+| 11 | `frontend/src/types/agent.ts` / `agentApi.ts` / `App.tsx` / `Composer.tsx` | — | [MODIFY] | 能力芯片：CapabilityInfo 类型、fetchCapabilities、selectedCapability state（localStorage 持续选中）、输入框上方芯片渲染（§3.7） |
 
 **明确不改**：SSE 事件结构、`thread_id` 逻辑（sessionStorage）、`EmptyState`/`MessageBubble` 等展示组件、后端 `QueryService`（01 已支持 model 参数）。
 
@@ -219,3 +257,4 @@ const handleModelChange = (name: string) => {
 6. **流式中禁用**：请求流式进行中按钮禁用（面板不可展开），结束后恢复
 7. **旧客户端兼容**：不带 model 字段的请求（curl 直接构造）正常走 default
 8. **类型同步**：`npm run lint`（tsc --noEmit）通过，无 any 逃逸
+9. **能力芯片**：输入框上方渲染 [数据查询] 芯片（来自 /api/capabilities，前端不硬编码）；点击选中 → 后端 `capability_source: "user"`、无规则/embedding/LLM 路由记录；芯片跨消息持续生效；再次点击取消 → 恢复自动路由；非法 capability 值 → 后端忽略不报错

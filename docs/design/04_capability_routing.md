@@ -1,7 +1,7 @@
 # 04 · 能力路由体系（M4）
 
 > 状态：`draft`（评审中）　|　上位文档：[00_overview.md](00_overview.md)（final）、[01_llm_factory.md](01_llm_factory.md)（final）
-> 修订记录：2026-09-21 初稿；同日**路由策略经项目所有者确认后重构**——识别通道定为"规则（高确定性）→ embedding 安全网 → LLM（暂定 deepseek）"四级递进，兜底统一为 default
+> 修订记录：2026-09-21 初稿；同日**路由策略经项目所有者确认后重构**——识别通道定为"规则（高确定性）→ embedding 安全网 → LLM（暂定 deepseek）"四级递进，兜底统一为 default；2026-09-23 新增 **tier-0 用户显式选择**（前端能力芯片、持续选中、selectable 字段、capability_source 来源标记）
 > 改造对象 `app/agent/graph.py`（19 节点 + 3 组条件边）已逐行核对（行号见 §4 清单）；03 文档的 `tool_metrics` 依赖本章的 `state["tool_calls"]` 数据源。
 
 ---
@@ -42,6 +42,7 @@ capabilities:
     description: 基于电商数仓的指标查询与SQL问答
     examples: ["上个月GMV多少", "华北地区的复购率", "查询数据：各地区销售额排行", "统计一下近7天的订单量"]
     entry: extract_keywords           # [NEW] 图中入口节点名——路由命中后分发到该节点
+    selectable: true                  # [NEW] 前端能力芯片可见（用户可显式选择）
     rules:                            # 规则快路径：只放"高度确定"的明确表述，不放模糊词（误命中代价分析见 §7.3）
       - "数据查询|查询数据|查一下数据"
       - "(帮我|给我)?(统计|查询|查一下).{0,12}(GMV|销售额|订单量|复购率|客单价|转化率|销量)"
@@ -49,6 +50,7 @@ capabilities:
     description: 通用助手对话：闲聊、使用帮助、回顾上次结果、无法归类问题的兜底
     examples: ["你好", "你能做什么", "刚才的结果是什么意思", "今天天气不错"]
     entry: default_answer
+    selectable: false                 # 兜底能力不出芯片——不选芯片 = 自动识别（含 default 兜底）
     rules:
       - "^(你好|hi|hello|在吗)"
 
@@ -67,6 +69,7 @@ routing:
 | `description` | ✅ | LLM 分类提示词中展示给模型的能力说明 |
 | `examples` | ✅ | 双重用途：LLM 提示词示例 + **embedding 安全网的向量化语料**（见 §3.2） |
 | `entry` | ✅ | 该能力在 graph 中的入口节点名（registry 校验其已注册） |
+| `selectable` | ✅ | 是否在前端能力芯片中展示（`true`=用户可显式选择；兜底能力恒 false，经项目所有者确认） |
 | `rules` | ❌ | **高确定性**正则快路径（如"查询数据""数据查询"）；刻意不放"多少""统计"这类模糊词 |
 | `routing.default_capability` | ✅ | 分类结果未知时兜底 |
 | `routing.error_capability` | ✅ | LLM 异常兜底（**统一为 default**：由通用对话节点致歉并建议重试） |
@@ -121,8 +124,12 @@ class CapabilityRegistry:
 
 ```python
 async def route_capability(state: DataAgentState, runtime: Runtime[DataAgentContext]) -> dict:
-    """取代 intent_classify。**四级递进通道**（每级未命中/失败自动落入下一级）：
+    """取代 intent_classify。**五级递进通道**（tier 0 用户显式选择，已经项目所有者确认）：
 
+    0. 用户显式选择（tier-0，最高优先级）：
+       前端能力芯片选中（注册表中 selectable=true 的能力）→ 请求携带 capability 字段
+       → 直接分发，跳过全部推断（确定性 100%）；选择在前端持续保持（模式开关式），
+       再次点击取消。非法值（不在注册表/selectable=false）→ 忽略 + warning，落入 1 级
     1. 规则快路径（features.rules_fast_path 开启时）：
        registry.match_rules(query) —— 只放"高度确定"的正则（如"查询数据""数据查询"），
        命中即分发，0 token、0 延迟
@@ -138,8 +145,11 @@ async def route_capability(state: DataAgentState, runtime: Runtime[DataAgentCont
     4. 兜底：上述任一环节异常且无结果 -> error_capability=default，
        由 default_answer 向用户致歉并建议重试
 
-    返回 {"capability": str, "intent": str(=capability, 兼容字段), "tool_calls": list[str],
-          "intent_reply": ""}
+    capability_source 记录路由来源："user" / "rules" / "embedding" / "llm" / "fallback"。
+    capability_routing=false（总开关关闭）时：忽略用户显式选择，恒 dataquery（关=旧行为）。
+
+    返回 {"capability": str, "intent": str(=capability, 兼容字段),
+          "capability_source": str, "tool_calls": list[str], "intent_reply": ""}
     副作用：写入 runtime.context 的 capability_holder（SSE 注入用，§3.4）
     progress 事件：step="理解用户意图"，status running/success（保持前端步骤条兼容）
     """
@@ -191,6 +201,7 @@ class DataAgentState(TypedDict):
     intent: str              # [语义变更→兼容字段] 旧五分类废弃；值 = capability 名
     intent_reply: str        # [不变] default_answer 的回复文本
     capability: str          # [NEW] 本次请求路由选中的能力名（v1: dataquery|default）
+    capability_source: str   # [NEW] 路由来源：user/rules/embedding/llm/fallback（03 评估按 source=user 过滤）
     tool_calls: list[str]    # [NEW] 本次请求调用的工具标识（v1 由路由写入；skill 化后为真实调用序列）
 ```
 
@@ -230,7 +241,8 @@ class DataAgentState(TypedDict):
 
 | 开关组合 | 行为 |
 |---------|------|
-| `capability_routing=true, rules_fast_path=true, embedding_route=true`（默认） | **四级通道全开**：规则命中 → 直接分发（0 token）；未命中 → embedding 安全网（≥0.85 分发）；仍未命中 → LLM 分类（deepseek）；任何异常 → default 兜底 |
+| `capability_routing=true`（任意子开关）+ **用户芯片选中** | **tier-0 直接分发**：跳过规则/embedding/LLM，capability_source=user——芯片是模式开关（前端持续保持），确定性 100% |
+| `capability_routing=true, rules_fast_path=true, embedding_route=true`（默认，未选芯片） | **四级通道全开**：规则命中 → 直接分发（0 token）；未命中 → embedding 安全网（≥0.85 分发）；仍未命中 → LLM 分类（deepseek）；任何异常 → default 兜底 |
 | `capability_routing=true, rules_fast_path=false` | 跳过规则通道：embedding → LLM → 兜底（用于量化规则通道贡献——03 对比实验） |
 | `capability_routing=true, embedding_route=false` | 跳过安全网：规则 → LLM → 兜底（用于量化 embedding 层贡献） |
 | `capability_routing=true, rules_fast_path=false, embedding_route=false` | 纯 LLM 分类基线 |
@@ -253,6 +265,8 @@ class DataAgentState(TypedDict):
 9. **启动校验**：capability_config.yaml 的 entry 指向不存在节点 → 应用启动即失败并报出能力名与节点名
 10. **遗留清理确认**：`grep -r "start_recall\|simple_answer\|intent_classify" app/` 零结果（prompt 文件名除外）
 11. **通道贡献实验**：`rules_fast_path=false` / `embedding_route=false` 两种组合各跑一次 03 评测，报告可对比三级识别通道各自贡献（token 节省与命中率）
+12. **能力芯片（tier-0）**：前端选中 [数据查询] 芯片 → 发送含 capability=dataquery 的请求 → 不触发规则/embedding/LLM（tracker 无路由推断记录）→ capability_source=user；芯片持续选中跨多条消息生效，再次点击取消后恢复自动路由；请求携带非法 capability 值 → 忽略并走自动通道（不报错）
+13. **tool_metrics 口径**：03 评测只统计自动路由（source≠user）——芯片选中不影响评估数据集的运行结果
 
 ---
 

@@ -111,6 +111,7 @@ graph TD
 | `features.usage_tracking` | bool | `true` | create_llm 给模型实例挂 LLMUsageTracker，自动采集 token/耗时/调用次数 | 不挂 tracker，LLM 调用照常，无任何计量 | M1 | 01 |
 | `features.capability_routing` | bool | `true` | 请求进入能力路由层（分类→分发），default 能力可用 | 绕过路由，请求直接进入 dataquery 问数链路（现状行为） | M4 | 04 |
 | `features.rules_fast_path` | bool | `true` | 分类前置规则通道生效，**高确定性**正则命中直接分发（0 token） | 关闭规则通道，未命中直接进入下一级（embedding/LLM） | M4 | 04 |
+| `features.capability_chip` | bool | `true` | 前端能力芯片可用（/api/capabilities 返回 selectable 能力；请求 capability 字段生效，tier-0 分发） | 芯片不渲染、请求 capability 字段被忽略——恒走自动识别（旧行为） | M4 | 02/04 |
 | `features.embedding_route` | bool | `true` | 规则未命中后启用 embedding 安全网（examples 向量相似度 ≥ 阈值即分发） | 跳过安全网，未命中直接走 LLM 分类 | M4 | 04 |
 | `features.context_management` | bool | `true` | 节点历史从 context_store/history_provider 统一供给，含截断与摘要钩子 | 各节点维持现状自行拼 `state["messages"]` | M5 | 05 |
 | `features.memory.short_term` | bool | `true` | **v1 无独立行为**：原"会话内检索注入"设计已被 05 轨迹完整注入吸收 | 同左 | M5 | 05 |
@@ -312,6 +313,7 @@ capabilities:
     description: 基于电商数仓的指标查询与SQL问答
     examples: ["上个月GMV多少", "华北地区的复购率"]
     entry: extract_keywords           # 图中入口节点名（路由命中后分发到该节点）
+    selectable: true                  # 前端能力芯片可见（tier-0 显式选择）
     rules:                            # 规则快路径：只放"高度确定"表述，模糊词交由 embedding/LLM 层
       - "数据查询|查询数据|查一下数据"
       - "(帮我|给我)?(统计|查询|查一下).{0,12}(GMV|销售额|订单量|复购率|客单价|转化率|销量)"
@@ -319,6 +321,7 @@ capabilities:
     description: 通用助手对话：闲聊、使用帮助、回顾上次结果、无法归类问题的兜底
     examples: ["你好", "你能做什么", "刚才的结果是什么意思"]
     entry: default_answer
+    selectable: false                 # 兜底能力不出芯片（不选芯片 = 自动识别含 default 兜底）
     rules:
       - "^(你好|hi|hello|在吗)"
 

@@ -340,6 +340,7 @@ def compute_tool_metrics(cases_result: list[dict]) -> dict:
 **工具命名规范**：`{capability}.{action}` 格式（如 `dataquery.search`）；04 定义工具注册表时沿用，评估的期望集与工具注册表使用同一命名空间，避免两套名字。
 
 **与意图指标的分工（v1 = 同源等价）**：当前确认的意图分流只有两个方向——数据查询（dataquery）/ 其它（default），所以 v1 的"主动与正确性"就是这两分流的路由命中情况：`intent_metrics` 与 `tool_metrics` 数值等价，分别从"分类视角"和"调用视角"呈现同一决策。二者真正分化发生在 skill+工具化之后：届时 agent 可能分类正确却选择不调用工具（或反之），tool_metrics 凭 `state["tool_calls"]` 独立发力，意图分类也可能演化为多级（能力选择 → 能力内子意图）。
+**口径补充（04 tier-0 芯片，2026-09-23）**：runner 不携带 capability 字段（恒走自动路由），`tool_metrics` 只统计 `capability_source ≠ "user"` 的自动路由行为——用户显式选择是确定性操作，不属于"agent 主动性"的度量范围。
 
 ---
 
